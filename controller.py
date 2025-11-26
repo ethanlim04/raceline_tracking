@@ -2,7 +2,10 @@ import numpy as np
 from numpy.typing import ArrayLike
 from racetrack import RaceTrack
 
-# Tuning parameters
+# ============================================================================
+# TUNING PARAMETERS
+# ============================================================================
+
 # Path following
 LOOKAHEAD_DISTANCE = 25.0      # Base lookahead distance (meters)
 BLEND_FACTOR = 0.5             # Raceline vs centerline (0=center, 1=race)
@@ -21,10 +24,17 @@ STEERING_KD = 0.15             # Steering D gain
 # Control loop timing
 DT = 0.1                       # Time step (seconds)
 
-# global state (integral/derivative)
+# ============================================================================
+# GLOBAL STATE (for integral/derivative terms)
+# ============================================================================
 
 prev_steering_error = 0.0
 steering_error_integral = 0.0
+
+
+# ============================================================================
+# UTILITY FUNCTIONS
+# ============================================================================
 
 def resample_path(path: np.ndarray, n_points: int) -> np.ndarray:
     """
@@ -145,6 +155,10 @@ def calculate_steering_effort(path: np.ndarray, width: np.ndarray,
     return avg_effort
 
 
+# ============================================================================
+# MAIN CONTROLLER
+# ============================================================================
+
 def controller(state: ArrayLike, parameters: ArrayLike, racetrack: RaceTrack) -> ArrayLike:
     """
     High-level controller: determines desired steering angle and velocity.
@@ -175,7 +189,10 @@ def controller(state: ArrayLike, parameters: ArrayLike, racetrack: RaceTrack) ->
     delta_max = parameters[4]  # Maximum steering angle
     v_max = parameters[5]      # Maximum velocity
     
-    # path selection and preperation
+    # ========================================================================
+    # PATH SELECTION AND PREPARATION
+    # ========================================================================
+    
     # Blend raceline with centerline for safety margin
     if hasattr(racetrack, 'raceline') and racetrack.raceline is not None:
         raceline = racetrack.raceline
@@ -196,67 +213,132 @@ def controller(state: ArrayLike, parameters: ArrayLike, racetrack: RaceTrack) ->
         axis=1
     )
     
-    # find current position on path  
+    # ========================================================================
+    # FIND CURRENT POSITION ON PATH
+    # ========================================================================
+    
     distances_to_path = np.linalg.norm(path - position, axis=1)
     nearest_idx = int(np.argmin(distances_to_path))
+    cross_track_error = distances_to_path[nearest_idx]
     
-    # speed planning
-    # Find point ahead where we need to check curvature for braking
-    speed_lookahead_idx = find_lookahead_point(
-        path, nearest_idx, LOOKAHEAD_DISTANCE
-    )
+    # Detect off-track situation (more than 5 meters from path)
+    OFF_TRACK_THRESHOLD = 5.0
+    off_track = cross_track_error > OFF_TRACK_THRESHOLD
     
-    # Calculate steering effort at future point
-    # Multiply by 2 for more conservative braking
-    future_steering_effort = 2 * calculate_steering_effort(
-        path, 
-        track_width, 
-        speed_lookahead_idx + CURVATURE_LOOKAHEAD,
-        window=STEERING_EFFORT_WINDOW
-    )
+    # ========================================================================
+    # SPEED PLANNING: Look ahead and brake for difficult sections
+    # ========================================================================
     
-    # Calculate safe speed based on curvature
-    if abs(future_steering_effort) > 0.001:
-        safe_speed = np.sqrt(MAX_LATERAL_ACCEL / abs(future_steering_effort))
+    if off_track:
+        # RECOVERY MODE: Slow down significantly when off-track
+        # This prevents spinning and allows controlled return to path
+        desired_velocity = min(v_max * 0.4, 30.0)  # Max 40% speed or 30 m/s
     else:
-        safe_speed = v_max
+        # NORMAL MODE: Use steering effort prediction
+        # Find point ahead where we need to check curvature for braking
+        speed_lookahead_idx = find_lookahead_point(
+            path, nearest_idx, LOOKAHEAD_DISTANCE
+        )
+        
+        # Calculate steering effort at future point
+        # Multiply by 2 for more conservative braking
+        future_steering_effort = 2 * calculate_steering_effort(
+            path, 
+            track_width, 
+            speed_lookahead_idx + CURVATURE_LOOKAHEAD,
+            window=STEERING_EFFORT_WINDOW
+        )
+        
+        # Calculate safe speed based on curvature
+        # v² = a_lateral / curvature (basic vehicle dynamics)
+        if abs(future_steering_effort) > 0.001:
+            safe_speed = np.sqrt(MAX_LATERAL_ACCEL / abs(future_steering_effort))
+        else:
+            safe_speed = v_max
+        
+        desired_velocity = min(safe_speed, v_max)
     
-    desired_velocity = min(safe_speed, v_max)
-
-    # Adaptive lookahead, adjust based on current speed
-    # Reduce lookahead at lower speeds for tighter control
-    # (100 - speed) / 8 creates a penalty that decreases with speed
-    lookahead_adjustment = int((100 - velocity) / 8)
-    adaptive_lookahead = max(
-        LOOKAHEAD_DISTANCE - lookahead_adjustment,
-        10.0  # Minimum lookahead
-    )
+    # ========================================================================
+    # ADAPTIVE LOOKAHEAD: Adjust based on current speed
+    # ========================================================================
     
-    lookahead_idx = find_lookahead_point(path, nearest_idx, adaptive_lookahead)
-
+    if off_track:
+        # RECOVERY MODE: Use very short, fixed lookahead
+        # Aim for nearest point on CENTERLINE (safest path)
+        center_distances = np.linalg.norm(racetrack.centerline - position, axis=1)
+        center_nearest_idx = int(np.argmin(center_distances))
+        
+        # Short lookahead for tight control during recovery
+        recovery_lookahead = 8.0  # Very short for precise correction
+        lookahead_idx = find_lookahead_point(
+            racetrack.centerline, 
+            center_nearest_idx, 
+            recovery_lookahead
+        )
+        lookahead_point = racetrack.centerline[lookahead_idx]
+        
+        # Check if lookahead point is behind us (causes spinning)
+        to_lookahead = lookahead_point - position
+        forward_direction = np.array([np.cos(heading), np.sin(heading)])
+        
+        # If lookahead is behind (dot product < 0), aim for nearest point instead
+        if np.dot(to_lookahead, forward_direction) < 0:
+            lookahead_point = racetrack.centerline[center_nearest_idx]
+    else:
+        # NORMAL MODE: Speed-adaptive lookahead
+        # Reduce lookahead at lower speeds for tighter control
+        # (100 - speed) / 8 creates a penalty that decreases with speed
+        lookahead_adjustment = int((100 - velocity) / 8)
+        adaptive_lookahead = max(
+            LOOKAHEAD_DISTANCE - lookahead_adjustment,
+            10.0  # Minimum lookahead
+        )
+        
+        lookahead_idx = find_lookahead_point(path, nearest_idx, adaptive_lookahead)
+        lookahead_point = path[lookahead_idx]
+    
+    # ========================================================================
+    # PURE PURSUIT STEERING CALCULATION
+    # ========================================================================
+    
     # Vector from current position to lookahead point
-    lookahead_vector = path[lookahead_idx] - position
+    lookahead_vector = lookahead_point - position
     lookahead_distance = np.linalg.norm(lookahead_vector)
     
     # Desired heading to reach lookahead point
     desired_heading = np.arctan2(lookahead_vector[1], lookahead_vector[0])
     
-    # Heading error
+    # Heading error (wrapped to [-π, π])
     heading_error = (desired_heading - heading + np.pi) % (2 * np.pi) - np.pi
     
     # Pure Pursuit curvature formula:
+    # κ = 2 * sin(α) / L_d
+    # where α is heading error, L_d is lookahead distance
     if lookahead_distance > 0.001:
         path_curvature = 2 * np.sin(heading_error) / lookahead_distance
     else:
         path_curvature = 0.0
     
     # Convert curvature to steering angle using bicycle model
+    # δ = arctan(wheelbase * κ)
     desired_steering = np.arctan(wheelbase * path_curvature)
     
     # Apply steering limits
+    if off_track:
+        # Extra limit when off-track to prevent spinning
+        # Reduce maximum steering to 60% of normal range
+        reduced_max = delta_max * 0.6
+        reduced_min = delta_min * 0.6
+        desired_steering = np.clip(desired_steering, reduced_min, reduced_max)
+    
     desired_steering = np.clip(desired_steering, delta_min, delta_max)
     
     return np.array([desired_steering, desired_velocity], dtype=float)
+
+
+# ============================================================================
+# LOWER-LEVEL CONTROLLER
+# ============================================================================
 
 def lower_controller(state: ArrayLike, desired: ArrayLike, 
                      parameters: ArrayLike) -> ArrayLike:
@@ -295,7 +377,10 @@ def lower_controller(state: ArrayLike, desired: ArrayLike,
     accel_min = parameters[8]
     accel_max = parameters[10]
     
-    # PID control for steering  
+    # ========================================================================
+    # PID CONTROL FOR STEERING
+    # ========================================================================
+    
     # Calculate error (wrapped to [-π, π])
     steering_error = (desired_steering - current_steering + np.pi) % (2 * np.pi) - np.pi
     
@@ -326,8 +411,11 @@ def lower_controller(state: ArrayLike, desired: ArrayLike,
     
     # Apply rate limits
     steering_rate = np.clip(steering_rate, steering_rate_min, steering_rate_max)
-
-    # P control for limits  
+    
+    # ========================================================================
+    # P CONTROL FOR VELOCITY
+    # ========================================================================
+    
     velocity_error = desired_velocity - current_velocity
     acceleration = VELOCITY_KP * velocity_error
     
