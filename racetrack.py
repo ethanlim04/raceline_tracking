@@ -5,7 +5,6 @@ import matplotlib.patches as patches
 import matplotlib.axes as axes
 
 class RaceTrack:
-
     def __init__(self, filepath : str):
         data = np.loadtxt(filepath, comments="#", delimiter=",")
         self.centerline = data[:, 0:2]

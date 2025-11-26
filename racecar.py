@@ -2,7 +2,6 @@ import numpy as np
 from numpy.typing import ArrayLike
 
 class RaceCar:
-
     @staticmethod
     def normalize_system(state : ArrayLike, input : ArrayLike, parameters : ArrayLike):
         assert(state.shape == (5,) and input.shape == (2,))
