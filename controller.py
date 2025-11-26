@@ -155,7 +155,7 @@ def controller(state: ArrayLike, parameters: ArrayLike, racetrack: RaceTrack) ->
     delta_max = parameters[4]
     v_max = parameters[5]
     
-    # Get path with simple blending
+    # Get path with DYNAMIC blending based on upcoming difficulty
     if hasattr(racetrack, 'raceline') and racetrack.raceline is not None:
         raceline = racetrack.raceline
         centerline = racetrack.centerline
@@ -163,7 +163,35 @@ def controller(state: ArrayLike, parameters: ArrayLike, racetrack: RaceTrack) ->
         if len(raceline) != len(centerline):
             centerline = resample_path(centerline, len(raceline))
         
-        path = BLEND_FACTOR * raceline + (1 - BLEND_FACTOR) * centerline
+        # Check difficulty of upcoming section to decide blend
+        temp_path = 0.5 * raceline + 0.5 * centerline
+        temp_distances = np.linalg.norm(temp_path - position, axis=1)
+        temp_nearest = int(np.argmin(temp_distances))
+        
+        temp_width = np.linalg.norm(
+            racetrack.right_boundary - racetrack.left_boundary, 
+            axis=1
+        )
+        
+        # Look ahead to see what's coming
+        upcoming_check_idx = find_lookahead_point(temp_path, temp_nearest, 20.0)
+        upcoming_difficulty = calculate_steering_effort(
+            temp_path, temp_width, upcoming_check_idx, window=25
+        )
+        
+        # DYNAMIC BLEND: More centerline in tight sections
+        if upcoming_difficulty > 1.0:
+            blend = 0.25  # 75% centerline - extreme hairpins
+        elif upcoming_difficulty > 0.7:
+            blend = 0.35  # 65% centerline - very tight
+        elif upcoming_difficulty > 0.5:
+            blend = 0.4   # 60% centerline - tight
+        elif upcoming_difficulty > 0.3:
+            blend = 0.45  # 55% centerline - moderate
+        else:
+            blend = BLEND_FACTOR  # 50/50 - easy sections
+        
+        path = blend * raceline + (1 - blend) * centerline
     else:
         path = racetrack.centerline
     
@@ -178,7 +206,7 @@ def controller(state: ArrayLike, parameters: ArrayLike, racetrack: RaceTrack) ->
     cross_track_error = distances_to_path[nearest_idx]
     
     # Off-track detection with moderate threshold
-    OFF_TRACK_THRESHOLD = 4.0  # Works for most tracks
+    OFF_TRACK_THRESHOLD = 3.5  # Slightly tighter for earlier recovery
     off_track = cross_track_error > OFF_TRACK_THRESHOLD
     
     # ========================================================================
@@ -186,8 +214,8 @@ def controller(state: ArrayLike, parameters: ArrayLike, racetrack: RaceTrack) ->
     # ========================================================================
     
     if off_track:
-        # Recovery mode
-        desired_velocity = min(v_max * 0.35, 25.0)
+        # Recovery mode - slow down more
+        desired_velocity = min(v_max * 0.3, 22.0)
     else:
         # Look ahead for speed planning
         speed_lookahead_idx = find_lookahead_point(path, nearest_idx, LOOKAHEAD_DISTANCE)
@@ -207,9 +235,11 @@ def controller(state: ArrayLike, parameters: ArrayLike, racetrack: RaceTrack) ->
         max_effort = max(future_effort, current_effort)
         
         # ADAPTIVE BRAKING: Scale multiplier based on effort
-        # Easy sections: 2x multiplier (fast)
-        # Hard sections: 4x multiplier (safe)
-        if max_effort > 0.8:
+        # Easy sections: 2.5x multiplier (fast)
+        # Extreme sections: 4.5x multiplier (very safe)
+        if max_effort > 1.0:
+            brake_multiplier = 4.5  # Insane hairpins
+        elif max_effort > 0.8:
             brake_multiplier = 4.0  # Extreme hairpins
         elif max_effort > 0.5:
             brake_multiplier = 3.5  # Tight corners
@@ -237,7 +267,7 @@ def controller(state: ArrayLike, parameters: ArrayLike, racetrack: RaceTrack) ->
         center_distances = np.linalg.norm(racetrack.centerline - position, axis=1)
         center_nearest_idx = int(np.argmin(center_distances))
         
-        recovery_lookahead = 5.0
+        recovery_lookahead = 4.0  # Very short for tight control
         lookahead_idx = find_lookahead_point(
             racetrack.centerline, center_nearest_idx, recovery_lookahead
         )
@@ -256,14 +286,18 @@ def controller(state: ArrayLike, parameters: ArrayLike, racetrack: RaceTrack) ->
         # CRITICAL: Reduce lookahead based on local difficulty
         local_difficulty = calculate_steering_effort(path, track_width, nearest_idx, window=10)
         
-        # Smooth, continuous scaling instead of hard thresholds
-        if local_difficulty > 0.1:
-            # Interpolate between 1.0 (easy) and 0.25 (extreme)
-            # This makes it work naturally across all track types
-            difficulty_factor = max(0.25, 1.0 - (local_difficulty - 0.1) * 0.6)
-            adaptive_lookahead *= difficulty_factor
+        # Smooth, continuous scaling with extra reduction for extreme cases
+        if local_difficulty > 1.2:
+            # Insane hairpins - look VERY close
+            difficulty_factor = 0.2
+        elif local_difficulty > 0.1:
+            # Interpolate between 1.0 (easy) and 0.2 (extreme)
+            difficulty_factor = max(0.2, 1.0 - (local_difficulty - 0.1) * 0.7)
+        else:
+            difficulty_factor = 1.0
         
-        adaptive_lookahead = max(adaptive_lookahead, 6.0)  # Absolute minimum
+        adaptive_lookahead *= difficulty_factor
+        adaptive_lookahead = max(adaptive_lookahead, 5.0)  # Absolute minimum
         
         lookahead_idx = find_lookahead_point(path, nearest_idx, adaptive_lookahead)
         lookahead_point = path[lookahead_idx]
