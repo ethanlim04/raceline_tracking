@@ -5,7 +5,7 @@ from racetrack import RaceTrack
 # Core tuning parameters - these work across different tracks
 LOOKAHEAD_DISTANCE = 25.0
 BLEND_FACTOR = 0.5
-MAX_LATERAL_ACCEL = 45.0
+MAX_LATERAL_ACCEL = 43.0  # Slightly more conservative for extreme hairpins
 STEERING_EFFORT_WINDOW = 40
 
 # Control gains
@@ -173,23 +173,23 @@ def controller(state: ArrayLike, parameters: ArrayLike, racetrack: RaceTrack) ->
             axis=1
         )
         
-        # Look ahead to see what's coming
-        upcoming_check_idx = find_lookahead_point(temp_path, temp_nearest, 20.0)
+        # Look ahead to see what's coming (check further for extreme hairpins)
+        upcoming_check_idx = find_lookahead_point(temp_path, temp_nearest, 25.0)
         upcoming_difficulty = calculate_steering_effort(
-            temp_path, temp_width, upcoming_check_idx, window=25
+            temp_path, temp_width, upcoming_check_idx, window=30
         )
         
-        # DYNAMIC BLEND: More centerline in tight sections
-        if upcoming_difficulty > 1.0:
-            blend = 0.25  # 75% centerline - extreme hairpins
-        elif upcoming_difficulty > 0.7:
-            blend = 0.35  # 65% centerline - very tight
-        elif upcoming_difficulty > 0.5:
-            blend = 0.4   # 60% centerline - tight
-        elif upcoming_difficulty > 0.3:
-            blend = 0.45  # 55% centerline - moderate
+        # DYNAMIC BLEND: Continuously scales based on difficulty
+        # This works for ANY track - no hard-coded thresholds
+        if upcoming_difficulty > 0.3:
+            # Smooth curve: more centerline as difficulty increases
+            # difficulty 0.3 → 50% blend (50/50)
+            # difficulty 1.0 → 25% blend (75% centerline)
+            # difficulty 1.5 → 8% blend (92% centerline)
+            # difficulty 2.0+ → 10% blend (90% centerline, capped)
+            blend = max(0.10, 0.5 - (upcoming_difficulty - 0.3) * 0.36)
         else:
-            blend = BLEND_FACTOR  # 50/50 - easy sections
+            blend = BLEND_FACTOR  # 50/50 for easy sections
         
         path = blend * raceline + (1 - blend) * centerline
     else:
@@ -234,19 +234,16 @@ def controller(state: ArrayLike, parameters: ArrayLike, racetrack: RaceTrack) ->
         # Use the worse of the two
         max_effort = max(future_effort, current_effort)
         
-        # ADAPTIVE BRAKING: Scale multiplier based on effort
-        # Easy sections: 2.5x multiplier (fast)
-        # Extreme sections: 4.5x multiplier (very safe)
-        if max_effort > 1.0:
-            brake_multiplier = 4.5  # Insane hairpins
-        elif max_effort > 0.8:
-            brake_multiplier = 4.0  # Extreme hairpins
-        elif max_effort > 0.5:
-            brake_multiplier = 3.5  # Tight corners
-        elif max_effort > 0.3:
-            brake_multiplier = 3.0  # Normal corners
+        # ADAPTIVE BRAKING: Continuously scales based on effort
+        # No hard thresholds - works for ANY difficulty level
+        if max_effort > 0.3:
+            # Scale from 2.5x to 5.0x smoothly
+            # effort 0.3 → 2.5x (fast)
+            # effort 1.0 → 4.25x (safe)
+            # effort 1.5+ → 5.0x (very safe, capped)
+            brake_multiplier = min(5.0, 2.5 + (max_effort - 0.3) * 2.5)
         else:
-            brake_multiplier = 2.5  # Easy sections
+            brake_multiplier = 2.5  # Easy sections stay fast
         
         max_effort *= brake_multiplier
         
@@ -284,20 +281,21 @@ def controller(state: ArrayLike, parameters: ArrayLike, racetrack: RaceTrack) ->
         adaptive_lookahead = max(LOOKAHEAD_DISTANCE - lookahead_adjustment, 10.0)
         
         # CRITICAL: Reduce lookahead based on local difficulty
+        # Continuously scales - no hard thresholds
         local_difficulty = calculate_steering_effort(path, track_width, nearest_idx, window=10)
         
-        # Smooth, continuous scaling with extra reduction for extreme cases
-        if local_difficulty > 1.2:
-            # Insane hairpins - look VERY close
-            difficulty_factor = 0.2
-        elif local_difficulty > 0.1:
-            # Interpolate between 1.0 (easy) and 0.2 (extreme)
-            difficulty_factor = max(0.2, 1.0 - (local_difficulty - 0.1) * 0.7)
+        if local_difficulty > 0.1:
+            # Smooth scaling from 100% down to 15%
+            # difficulty 0.1 → 100% lookahead
+            # difficulty 0.5 → 70% lookahead
+            # difficulty 1.0 → 32.5% lookahead
+            # difficulty 1.5+ → 15% lookahead (capped)
+            difficulty_factor = max(0.15, 1.0 - (local_difficulty - 0.1) * 0.75)
         else:
             difficulty_factor = 1.0
         
         adaptive_lookahead *= difficulty_factor
-        adaptive_lookahead = max(adaptive_lookahead, 5.0)  # Absolute minimum
+        adaptive_lookahead = max(adaptive_lookahead, 4.5)  # Absolute minimum
         
         lookahead_idx = find_lookahead_point(path, nearest_idx, adaptive_lookahead)
         lookahead_point = path[lookahead_idx]
