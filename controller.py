@@ -5,7 +5,8 @@ from racetrack import RaceTrack
 # Core tuning parameters - these work across different tracks
 LOOKAHEAD_DISTANCE = 25.0
 BLEND_FACTOR = 0.5
-MAX_LATERAL_ACCEL = 43.0  # Slightly more conservative for extreme hairpins
+# MAX_LATERAL_ACCEL = 43.0  # Slightly more conservative for extreme hairpins
+MAX_LATERAL_ACCEL = 10.0  # Wy slower for monza hairpin turn
 STEERING_EFFORT_WINDOW = 40
 
 # Control gains
